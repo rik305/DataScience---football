@@ -14,6 +14,9 @@ teams = r['teams']
 players = pd.json_normalize(players)
 teams = pd.json_normalize(teams)
 
+t = [0]
+for i in range(len(teams["name"])):
+    t.append(teams.loc[i]['name'])
 
 # Constants for positions
 GOALKEEPER = 1
@@ -22,7 +25,7 @@ MIDFIELDER = 3
 FORWARD = 4
 
 # Define your budget and number of players needed per position
-budget = 1040 
+budget = 1000
 team_size = 15
 gk_size = 2
 def_size = 5
@@ -40,6 +43,7 @@ players.merge(teams, left_on='team', right_index=True, suffixes=('', '_team'))
 
 for i in players.columns:
     print(i)
+
 
 players = players[["first_name","second_name","total_points","points_per_game","form","now_cost","selected_by_percent","chance_of_playing_this_round","element_type","team","id"]]
 
@@ -128,7 +132,7 @@ while len(team) != 15:
         positions[player['element_type']-1] += 1
         teams[player['team']] += 1
         c += 1
-        i = 3
+        i = 2
         s *= -1
         
     i += 1
@@ -139,6 +143,7 @@ print("Team:")
 for i in team:
     print (i[0], players.loc[i[0]]['count'])
     print (players.loc[i[0]]['total_points'])
+    print (t[(players.loc[i[0]]['team'])])
 
 print("Total Cost:", cost)
 print("Remaining Budget:", budget)
@@ -151,11 +156,12 @@ def tp_352(team):
     print("\n")
     for i in [0,2,3,4,7,8,9,10,11,12,13]:
         name = team[i][0].split()
-        s+=name[0][0]+". "+name[-1]+"  "
+        s+=name[0][0]+". "+name[-1]+"  ""("+t[(players.loc[team[i][0]]['team'])]+")   "
         if (i in [0,4,11,13]):
             print(s.center(100), "\n")
             s = ''
         tp += players.loc[team[i][0]]['total_points']
+    tp+=players.iloc[0]['total_points']
     print(("Total Points: " + (str(tp))).center(100))
     print("\n")
     return tp
@@ -167,11 +173,12 @@ def tp_442(team):
     print("\n")
     for i in [0,2,3,4,5,7,8,9,10,12,13]:
         name = team[i][0].split()
-        s+=name[0][0]+". "+name[-1]+"  "
+        s+=name[0][0]+". "+name[-1]+"  ""("+t[(players.loc[team[i][0]]['team'])]+")"
         if (i in [0,5,10,13]):
             print(s.center(100), "\n")
             s = ''
         tp += players.loc[team[i][0]]['total_points']
+    tp+=players.iloc[0]['total_points']
     print(("Total Points: " + (str(tp))).center(100))
     print("\n")
     return tp
@@ -185,11 +192,12 @@ def tp_343(team):
     print("\n")
     for i in [0,2,3,4,7,8,9,10,12,13,14]:
         name = team[i][0].split()
-        s+=name[0][0]+". "+name[-1]+"  "
+        s+=name[0][0]+". "+name[-1]+"  " +"("+t[(players.loc[team[i][0]]['team'])]+")"
         if (i in [0,4,10,14]):
             print(s.center(100), "\n")
             s = ''
         tp += players.loc[team[i][0]]['total_points']
+    tp+=players.iloc[0]['total_points']
     print(("Total Points: " + (str(tp))).center(100))
     print("\n")
     return tp
@@ -200,3 +208,8 @@ def get_gameweek_history(player_id):
     ).json()
     df = pd.json_normalize(r['history'])
     return df 
+
+print(players.head(20))
+
+tp_352(team)
+
