@@ -1,3 +1,9 @@
 numpy==2.2.3
 pandas==2.2.3
 Requests==2.32.3
+
+# fpl_agent
+pydantic==2.9.2
+python-dotenv==1.0.1
+litellm==1.52.0
+rapidfuzz==3.10.1
