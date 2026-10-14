@@ -1,10 +1,10 @@
 """
 Agent loop for the FPL assistant.
 
-Uses LiteLLM so the same code path supports both OpenAI (`OPENAI_API_KEY`)
-and Google Gemini (`GEMINI_API_KEY`) function calling without branching
-logic per-provider. API keys are loaded via python-dotenv from a local
-`.env` file (see `.env.example`).
+Uses LiteLLM so the same code path supports OpenAI (`OPENAI_API_KEY`),
+Google Gemini (`GEMINI_API_KEY`), and Groq (`GROQ_API_KEY`) function calling
+without branching logic per-provider. API keys are loaded via python-dotenv
+from a local `.env` file (see `.env.example`).
 
 The agent is given a concise system prompt establishing it as a data-driven
 FPL strategist, then runs a standard "tool calling" loop: the LLM picks a
@@ -16,6 +16,11 @@ Tool execution errors (including player-not-found / invalid input) are
 caught and returned to the model as structured error payloads rather than
 raised, so the LLM can recover (e.g. retry with a suggested player name)
 instead of crashing the conversation.
+
+Every LLM call passes through `fpl_agent.rate_limiter.LocalRateLimiter`
+first - a hard, client-side RPM/RPD/TPM ceiling enforced *before* any network
+call, so the agent can never run away and exceed a free tier (Groq's
+included) regardless of what the provider's own rate limits are set to.
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 from pydantic import BaseModel, ValidationError
 
+from fpl_agent.rate_limiter import LocalRateLimiter, RateLimitExceeded
 from fpl_agent.tools import TOOL_REGISTRY
 
 load_dotenv()
@@ -60,13 +66,15 @@ def _default_model() -> str:
     override = os.getenv("FPL_AGENT_MODEL")
     if override:
         return override
+    if os.getenv("GROQ_API_KEY"):
+        return "groq/openai/gpt-oss-20b"
     if os.getenv("OPENAI_API_KEY"):
         return "gpt-4o-mini"
     if os.getenv("GEMINI_API_KEY"):
         return "gemini/gemini-1.5-flash"
     raise RuntimeError(
-        "No API key found. Set OPENAI_API_KEY or GEMINI_API_KEY in your environment "
-        "(or a .env file) before running the agent."
+        "No API key found. Set GROQ_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY in your "
+        "environment (or a .env file) before running the agent."
     )
 
 
@@ -119,11 +127,19 @@ def _execute_tool(name: str, raw_arguments: str) -> str:
 class FPLAgent:
     """A minimal, provider-agnostic tool-calling agent for FPL questions."""
 
-    def __init__(self, model: Optional[str] = None, verbose: bool = False):
+    def __init__(
+        self,
+        model: Optional[str] = None,
+        verbose: bool = False,
+        rate_limiter: Optional[LocalRateLimiter] = None,
+    ):
         self.model = model or _default_model()
         self.verbose = verbose
         self.tools = _tool_definitions()
         self.history: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # Hard local ceiling on LLM calls (RPM/RPD/TPM) - enforced before every request,
+        # regardless of provider, so usage can never run away past free-tier limits.
+        self.rate_limiter = rate_limiter or LocalRateLimiter()
 
     def reset(self) -> None:
         self.history = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -135,6 +151,14 @@ class FPLAgent:
         self.history.append({"role": "user", "content": question})
 
         for _ in range(MAX_TOOL_ITERATIONS):
+            estimated_tokens = sum(
+                self.rate_limiter.estimate_tokens(str(m.get("content") or "")) for m in self.history
+            )
+            try:
+                self.rate_limiter.check_and_record(estimated_tokens=estimated_tokens)
+            except RateLimitExceeded as exc:
+                return f"🛑 {exc}"
+
             try:
                 response = litellm.completion(
                     model=self.model,

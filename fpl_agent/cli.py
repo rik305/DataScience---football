@@ -20,7 +20,7 @@ from fpl_agent.agent import FPLAgent
 BANNER = """\
 ⚽ FPL Agent - data-driven Fantasy Premier League assistant
 Type your question (transfers, captaincy, chip timing, player stats).
-Commands: 'reset' to clear conversation history, 'exit' or 'quit' to leave.
+Commands: 'reset' to clear history, 'limits' to show rate-limit usage, 'exit'/'quit' to leave.
 """
 
 
@@ -57,6 +57,15 @@ def main() -> None:
         if question.lower() == "reset":
             agent.reset()
             print("🔄 Conversation history cleared.")
+            continue
+        if question.lower() == "limits":
+            status = agent.rate_limiter.status()
+            print(
+                f"📊 Rate limit status: {status['requests_last_minute']}/"
+                f"{status['max_requests_per_minute']} req/min, "
+                f"{status['requests_today']}/{status['max_requests_per_day']} req/day "
+                f"({status['remaining_today']} remaining today)."
+            )
             continue
 
         answer = agent.ask(question)

@@ -17,6 +17,9 @@ venv/
 env/
 .pytest_cache/
 
+# fpl_agent local runtime state (rate-limit counters, not source)
+fpl_agent/.rate_limit_state.json
+
 # Node / frontend (frontend/ has its own .gitignore too, kept here as a safety net)
 node_modules/
 frontend/build/
