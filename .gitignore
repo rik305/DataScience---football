@@ -19,6 +19,7 @@ env/
 
 # fpl_agent local runtime state (rate-limit counters, not source)
 fpl_agent/.rate_limit_state.json
+fpl_agent/.rate_limit_state.lock
 
 # Node / frontend (frontend/ has its own .gitignore too, kept here as a safety net)
 node_modules/

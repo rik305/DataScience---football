@@ -122,12 +122,21 @@ class _CacheEntry:
     fetched_at: float
 
 
+class ManagerNotFoundError(Exception):
+    """Raised when an FPL manager/team ID can't be resolved (invalid ID or no picks set yet)."""
+
+
 class FPLDataStore:
     """TTL-cached accessor around `fpl.load_rated_players()`."""
 
     def __init__(self, ttl_seconds: int = CACHE_TTL_SECONDS):
         self.ttl_seconds = ttl_seconds
         self._cache: Optional[_CacheEntry] = None
+        # Per-manager-id cache of fetched squads, plus "the currently active team"
+        # for this session, so the agent can answer "my team" style follow-up
+        # questions without the caller having to re-supply the FPL ID each time.
+        self._squad_cache: dict[int, _CacheEntry] = {}
+        self.active_fpl_id: Optional[int] = None
 
     def get_universe(self, force_refresh: bool = False) -> dict:
         now = time.time()
@@ -168,6 +177,43 @@ class FPLDataStore:
 
     def by_position(self, element_type: int, force_refresh: bool = False) -> pd.DataFrame:
         return self.get_universe(force_refresh=force_refresh)["by_position"][element_type]
+
+    # -- manager / "my team" support ---------------------------------------------
+
+    def get_manager_squad(self, fpl_id: int, force_refresh: bool = False, set_active: bool = True) -> dict:
+        """
+        Fetch (and cache) a manager's live squad from the FPL API as a plain list
+        of player dicts under `squad` (see `fpl.load_manager_squad`). Raises
+        `ManagerNotFoundError` for an invalid ID or a team with no picks set yet.
+
+        By default also makes this the "active" team for the session, so
+        `active_squad()`/`get_my_team` can recall it without the ID being
+        supplied again.
+        """
+        now = time.time()
+        cached = self._squad_cache.get(fpl_id)
+        if force_refresh or cached is None or (now - cached.fetched_at) > self.ttl_seconds:
+            try:
+                data = fpl.load_manager_squad(fpl_id)
+            except ValueError as exc:
+                raise ManagerNotFoundError(str(exc)) from exc
+            cached = _CacheEntry(data=data, fetched_at=now)
+            self._squad_cache[fpl_id] = cached
+
+        if set_active:
+            self.active_fpl_id = fpl_id
+
+        return cached.data
+
+    def active_squad(self) -> dict:
+        """Return the currently active manager's squad (set via `get_manager_squad`).
+        Raises `ManagerNotFoundError` if no FPL ID has been set yet this session."""
+        if self.active_fpl_id is None:
+            raise ManagerNotFoundError(
+                "No FPL team ID has been set for this session yet. "
+                "Provide your FPL manager/team ID first (e.g. 'my FPL ID is 1234567')."
+            )
+        return self.get_manager_squad(self.active_fpl_id, set_active=False)
 
     def find_player(self, query: str, limit: int = 5) -> "PlayerMatch":
         """

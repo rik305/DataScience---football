@@ -421,6 +421,99 @@ def tp_343(team, players, team_names):
     return tp
 
 
+def current_event_id(bootstrap):
+    """
+    Determine the gameweek whose squad reflects a manager's *current* team.
+    Prefers the event flagged 'is_current' (true right up until the next
+    deadline passes, even after that gameweek's matches finish) since that's
+    when the manager's picks still represent their live squad. Falls back to
+    the next upcoming event, then the most recently finished one.
+    """
+    events = bootstrap.get('events', [])
+    current = next((e for e in events if e.get('is_current')), None)
+    if current is None:
+        current = next((e for e in events if e.get('is_next')), None)
+    if current is None:
+        finished = [e for e in events if e.get('finished')]
+        current = finished[-1] if finished else (events[0] if events else None)
+    return current['id'] if current else None
+
+
+def fetch_manager_entry(manager_id):
+    """Fetch a manager's public entry info (team name, manager name, bank/value)."""
+    resp = requests.get(f'{base_url}entry/{manager_id}/')
+    if resp.status_code == 404:
+        raise ValueError(f"No FPL manager found with ID {manager_id}.")
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_manager_picks(manager_id, event_id):
+    """Fetch a manager's 15-player squad (picks) for a given gameweek."""
+    resp = requests.get(f'{base_url}entry/{manager_id}/event/{event_id}/picks/')
+    if resp.status_code == 404:
+        raise ValueError(
+            f"No picks found for manager {manager_id} in gameweek {event_id} "
+            "(the team may not have been set for this gameweek yet)."
+        )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def load_manager_squad(manager_id, bootstrap=None):
+    """
+    Fetch a manager's live current squad from the FPL API and return it as a
+    plain list of player dicts (one per squad member), enriched with each
+    player's name/team/price from the same bootstrap data used everywhere
+    else in this pipeline - no separate/duplicate data source.
+
+    Returns a dict with manager/team metadata plus `squad`: a list of 15
+    player dicts ordered by squad slot (1-11 starting XI, 12-15 bench).
+    """
+    bootstrap = bootstrap or fetch_bootstrap()
+    players_raw, teams, team_names = build_teams(bootstrap)
+    players_all = build_players(players_raw, ppg_threshold=None, form_threshold=None)
+    players_by_id = players_all.reset_index().set_index('id')
+
+    event_id = current_event_id(bootstrap)
+    if event_id is None:
+        raise ValueError("Could not determine the current FPL gameweek from the bootstrap data.")
+
+    entry = fetch_manager_entry(manager_id)
+    picks_payload = fetch_manager_picks(manager_id, event_id)
+    picks = picks_payload.get('picks', [])
+    history = picks_payload.get('entry_history', {})
+
+    squad = []
+    for pick in picks:
+        element_id = pick['element']
+        if element_id not in players_by_id.index:
+            continue
+        row = players_by_id.loc[element_id]
+        squad.append({
+            "player_name": row['name'],
+            "element_type": int(row['element_type']),
+            "team": team_names[row['team']] if row['team'] < len(team_names) else str(row['team']),
+            "price_m": round(row['now_cost'] / 10, 1),
+            "squad_slot": pick['position'],
+            "on_bench": pick['position'] > 11,
+            "is_captain": bool(pick.get('is_captain')),
+            "is_vice_captain": bool(pick.get('is_vice_captain')),
+            "multiplier": pick.get('multiplier', 1),
+        })
+    squad.sort(key=lambda p: p["squad_slot"])
+
+    return {
+        "manager_id": int(manager_id),
+        "team_name": entry.get('name'),
+        "manager_name": f"{entry.get('player_first_name', '')} {entry.get('player_last_name', '')}".strip(),
+        "gameweek": event_id,
+        "bank_m": round(history.get('bank', 0) / 10, 1),
+        "team_value_m": round(history.get('value', 0) / 10, 1),
+        "squad": squad,
+    }
+
+
 def get_gameweek_history(player_id):
     r = requests.get(
         base_url + 'element-summary/' + str(player_id) + '/'

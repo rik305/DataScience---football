@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field, field_validator
 import fpl
 from fpl_agent.data_loader import (
     POSITION_NAMES,
+    ManagerNotFoundError,
     PlayerNotFoundError,
     injury_status,
     resolve_position,
@@ -317,6 +318,132 @@ def recommend_captain(candidate_names: list[str]) -> CaptainRecommendation | Too
 
 
 # ---------------------------------------------------------------------------
+# set_fpl_team / get_my_team
+# ---------------------------------------------------------------------------
+
+class SetFPLTeamInput(BaseModel):
+    fpl_id: int = Field(
+        ...,
+        gt=0,
+        description=(
+            "The user's public FPL manager/team ID (the number in the URL when viewing "
+            "their team on the official FPL site, e.g. fantasy.premierleague.com/entry/1234567/...)."
+        ),
+    )
+
+
+class SquadPlayer(BaseModel):
+    player_name: str
+    position: str
+    team: str
+    price_m: float
+    squad_slot: int = Field(..., description="1-11 = starting XI (ordered GK/DEF/MID/FWD), 12-15 = bench.")
+    on_bench: bool
+    is_captain: bool
+    is_vice_captain: bool
+    form: Optional[float] = None
+    points_per_game: Optional[float] = None
+    next_fixture_opponent: Optional[str] = None
+    next_fixture_fdr: Optional[float] = None
+    rank_score: Optional[int] = Field(
+        None, description="The repo's existing multi-criteria rank score, if the player is in the ranked pool."
+    )
+
+
+class ManagerSquad(BaseModel):
+    fpl_id: int
+    team_name: Optional[str]
+    manager_name: Optional[str]
+    gameweek: int
+    bank_m: float
+    team_value_m: float
+    squad: list[SquadPlayer] = Field(..., description="All 15 squad players, list ordered by squad slot.")
+
+
+def _build_squad_player(player: dict, players_all: pd.DataFrame, fixtures_df, team_names: list) -> SquadPlayer:
+    """
+    Build a SquadPlayer, enriching each pick with form/points-per-game and their
+    single next-fixture FDR. This is deliberately included inline (rather than
+    requiring a separate get_player_stats call per squad member) so a single
+    set_fpl_team/get_my_team call carries enough signal for common questions
+    ("who should I bench", "who's out of form") - keeping tool round-trips (and
+    therefore LLM token/request usage against the local rate limiter) low.
+    """
+    form = ppg = None
+    opponent = fdr = None
+    name = player["player_name"]
+    if name in players_all.index:
+        row = players_all.loc[name]
+        form = float(row.get("form", 0.0))
+        ppg = float(row.get("ppg", 0.0))
+        breakdown = fpl.player_fixture_breakdown(row, fixtures_df, team_names, lookahead=1)
+        if breakdown:
+            opponent = breakdown[0]["opponent"]
+            fdr = breakdown[0]["fdr"]
+
+    return SquadPlayer(
+        player_name=name,
+        position=POSITION_NAMES.get(player["element_type"], "Unknown"),
+        team=player["team"],
+        price_m=float(player["price_m"]),
+        squad_slot=int(player["squad_slot"]),
+        on_bench=bool(player["on_bench"]),
+        is_captain=bool(player["is_captain"]),
+        is_vice_captain=bool(player["is_vice_captain"]),
+        form=form,
+        points_per_game=ppg,
+        next_fixture_opponent=opponent,
+        next_fixture_fdr=fdr,
+        rank_score=store.rank_score(name),
+    )
+
+
+def _build_manager_squad_response(data: dict) -> ManagerSquad:
+    universe = store.get_universe()
+    players_all = universe["players_all"]
+    fixtures_df = universe["fixtures"]
+    team_names = universe["team_names"]
+
+    return ManagerSquad(
+        fpl_id=data["manager_id"],
+        team_name=data.get("team_name"),
+        manager_name=data.get("manager_name") or None,
+        gameweek=data["gameweek"],
+        bank_m=data["bank_m"],
+        team_value_m=data["team_value_m"],
+        squad=[_build_squad_player(p, players_all, fixtures_df, team_names) for p in data["squad"]],
+    )
+
+
+def set_fpl_team(fpl_id: int) -> ManagerSquad | ToolError:
+    """
+    Look up a manager's live FPL squad by their public team ID and store it as the
+    active team for this session (as a list of 15 player records), so later
+    questions can reference "my team" without re-supplying the ID.
+    """
+    try:
+        data = store.get_manager_squad(fpl_id)
+    except ManagerNotFoundError as exc:
+        return ToolError(error=str(exc))
+
+    return _build_manager_squad_response(data)
+
+
+class GetMyTeamInput(BaseModel):
+    """No arguments - recalls whichever FPL team was most recently set via set_fpl_team."""
+
+
+def get_my_team() -> ManagerSquad | ToolError:
+    """Return the currently active manager's squad (set earlier via set_fpl_team this session)."""
+    try:
+        data = store.active_squad()
+    except ManagerNotFoundError as exc:
+        return ToolError(error=str(exc))
+
+    return _build_manager_squad_response(data)
+
+
+# ---------------------------------------------------------------------------
 # Tool registry used by the agent loop (name -> (input_schema, fn))
 # ---------------------------------------------------------------------------
 
@@ -343,6 +470,23 @@ TOOL_REGISTRY = {
         "description": (
             "Compare a list of candidate players by expected points and upcoming fixture "
             "difficulty to recommend a Captain and Vice-Captain."
+        ),
+    },
+    "set_fpl_team": {
+        "schema": SetFPLTeamInput,
+        "fn": set_fpl_team,
+        "description": (
+            "Load a manager's live current 15-player FPL squad by their public FPL team ID "
+            "(from their team URL on the official site) and set it as the active team for "
+            "this conversation, so later questions can refer to 'my team' / 'my squad'."
+        ),
+    },
+    "get_my_team": {
+        "schema": GetMyTeamInput,
+        "fn": get_my_team,
+        "description": (
+            "Recall the squad most recently loaded via set_fpl_team for this conversation "
+            "(the user's current 15 players, prices, bank, captain/vice-captain, bench)."
         ),
     },
 }
