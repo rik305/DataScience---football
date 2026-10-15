@@ -354,6 +354,78 @@ def pick_squad(players, budget=1000, gk_size=2, def_size=5, mid_size=5, fwd_size
     return team, cost, budget
 
 
+def rebuild_squad(players, players_all, locked_names, excluded_names, budget,
+                   gk_size=2, def_size=5, mid_size=5, fwd_size=3, max_per_team=3):
+    """
+    Build a 15-man squad made of `locked_names` (players being kept) plus the
+    best-ranked affordable replacements for the remaining slots - reusing the
+    exact same greedy, budget-balancing heuristic as `pick_squad` (the repo's
+    existing "best team" algorithm), just seeded with a fixed core instead of
+    building entirely from scratch.
+
+    `players` is the ranked candidate pool (as returned by `load_rated_players`,
+    already sorted by rank `count`) used to pick replacements.
+    `players_all` is the unfiltered universe, used to resolve cost/team/position
+    for the locked players (who may currently sit outside the ranked pool - e.g.
+    injured/out of form - but are still being kept).
+    `excluded_names` are never considered as replacements (typically the players
+    being transferred out - without this they could be picked straight back).
+    `budget` is the total 0.1m-unit budget available for the slots NOT locked
+    (i.e. total squad budget minus the locked players' cost).
+
+    Returns (team, cost, budget_remaining) exactly like `pick_squad`, where
+    `team` is a list of [player_name, element_type, player_id].
+    """
+    limits = [0, gk_size, def_size, mid_size, fwd_size]
+    positions = [0, 0, 0, 0, 0]
+    iteams = [0] * 21
+    team = []
+    cost = 0
+
+    for name in locked_names:
+        row = players_all.loc[name]
+        element_type = int(row['element_type'])
+        team.append([name, element_type, int(row['id'])])
+        cost += int(row['now_cost'])
+        positions[element_type - 1] += 1
+        iteams[int(row['team'])] += 1
+
+    blocked = set(excluded_names) | set(locked_names)
+    c = len(team)
+    i = 0
+    s = 5
+
+    while len(team) != 15:
+        if i >= len(players):
+            raise RuntimeError(
+                "Ran out of affordable/eligible candidates before filling all 15 slots "
+                "- the remaining budget is likely too tight for the positions still needed."
+            )
+        pavg = budget / (15 - c)
+        player = players.iloc[i]
+        if (positions[player['element_type'] - 1] < limits[player['element_type']]
+                and iteams[player['team']] < max_per_team and pavg + s >= player['now_cost']
+                and player.name not in blocked):
+            team.append([player.name, player['element_type'], player['id']])
+            cost += player['now_cost']
+            budget -= player['now_cost']
+            positions[player['element_type'] - 1] += 1
+            iteams[player['team']] += 1
+            blocked.add(player.name)
+            c += 1
+            i = 2
+            s *= -1
+        i += 1
+
+    def _sort_key(entry):
+        name, element_type, _id = entry
+        count = players.loc[name]['count'] if name in players.index else 0
+        return 1000 * element_type + count
+
+    team = sorted(team, key=_sort_key)
+    return team, cost, budget
+
+
 def print_team(team, players, team_names, cost, budget):
     print("----------------------------------")
     print("Team:")

@@ -11,6 +11,7 @@ separate/duplicate scoring logic here, and no mock data.
 
 from __future__ import annotations
 
+import difflib
 from typing import Literal, Optional
 
 import pandas as pd
@@ -465,6 +466,135 @@ def get_my_team() -> ManagerSquad | ToolError:
 
 
 # ---------------------------------------------------------------------------
+# rebuild_squad
+# ---------------------------------------------------------------------------
+
+class RebuildSquadInput(BaseModel):
+    transfer_out_names: list[str] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Names of players in your current squad (loaded via set_fpl_team/get_my_team) "
+            "to transfer out. Replacements for the freed slots are chosen automatically by "
+            "the repo's existing rank-score squad-building algorithm."
+        ),
+    )
+
+
+def _match_in_squad(raw_name: str, squad_names: list[str]) -> Optional[str]:
+    """Resolve a user-supplied name against the (small) list of current squad player
+    names only - exact match first, then a close-match fallback (no need for the
+    full fuzzy-matching machinery used for the whole player universe)."""
+    exact = next((n for n in squad_names if n.lower() == raw_name.lower()), None)
+    if exact:
+        return exact
+    matches = difflib.get_close_matches(raw_name, squad_names, n=1, cutoff=0.6)
+    return matches[0] if matches else None
+
+
+class RebuiltSquadPlayer(BaseModel):
+    player_name: str
+    position: str
+    team: str
+    price_m: float
+    status: Literal["kept", "brought_in"]
+
+
+class SquadRebuildResult(BaseModel):
+    transferred_out: list[str]
+    budget_available_m: float = Field(
+        ..., description="Bank + the selling price of every transferred-out player."
+    )
+    total_cost_m: float
+    leftover_budget_m: float
+    squad: list[RebuiltSquadPlayer] = Field(..., description="All 15 players in the rebuilt squad.")
+
+
+def rebuild_squad(transfer_out_names: list[str]) -> SquadRebuildResult | ToolError:
+    """
+    Take the currently active squad (set via set_fpl_team/get_my_team), remove the
+    named players, and refill those slots with the best-ranked affordable
+    replacements - reusing the repo's existing squad-building algorithm
+    (`fpl.pick_squad`'s heuristic, generalised to keep a fixed core) rather than a
+    separate/duplicate scoring approach. Everyone else in the squad is kept as-is.
+    """
+    try:
+        data = store.active_squad()
+    except ManagerNotFoundError as exc:
+        return ToolError(error=str(exc))
+
+    squad = data["squad"]
+    squad_names = [p["player_name"] for p in squad]
+    price_by_name = {p["player_name"]: p["price_m"] for p in squad}
+
+    resolved_out: list[str] = []
+    unresolved: list[str] = []
+    for raw_name in transfer_out_names:
+        match = _match_in_squad(raw_name, squad_names)
+        if match is None or match in resolved_out:
+            unresolved.append(raw_name)
+        else:
+            resolved_out.append(match)
+
+    if unresolved:
+        return ToolError(
+            error=(
+                f"Couldn't match {unresolved} to anyone in your current squad. "
+                "They must be transferred out by name exactly as they appear in your squad."
+            ),
+            suggestions=[n for n in squad_names if n not in resolved_out],
+        )
+
+    locked_names = [n for n in squad_names if n not in resolved_out]
+    sold_value_m = sum(price_by_name[n] for n in resolved_out)
+    budget_available_m = round(data["bank_m"] + sold_value_m, 1)
+    budget_units = round(budget_available_m * 10)
+
+    universe = store.get_universe()
+    players, players_all, team_names = universe["players"], universe["players_all"], universe["team_names"]
+
+    try:
+        team, cost_units, leftover_units = fpl.rebuild_squad(
+            players=players,
+            players_all=players_all,
+            locked_names=locked_names,
+            excluded_names=resolved_out,
+            budget=budget_units,
+        )
+    except RuntimeError as exc:
+        return ToolError(
+            error=(
+                f"Couldn't build a valid replacement squad with £{budget_available_m}m "
+                f"available ({exc})."
+            )
+        )
+    except KeyError as exc:
+        return ToolError(error=f"Couldn't resolve a locked player's data: {exc}")
+
+    locked_set = set(locked_names)
+    squad_out = []
+    for name, element_type, _id in team:
+        row = players_all.loc[name]
+        squad_out.append(
+            RebuiltSquadPlayer(
+                player_name=name,
+                position=POSITION_NAMES.get(element_type, "Unknown"),
+                team=team_names[row["team"]] if row["team"] < len(team_names) else str(row["team"]),
+                price_m=round(row["now_cost"] / 10, 1),
+                status="kept" if name in locked_set else "brought_in",
+            )
+        )
+
+    return SquadRebuildResult(
+        transferred_out=resolved_out,
+        budget_available_m=budget_available_m,
+        total_cost_m=round(cost_units / 10, 1),
+        leftover_budget_m=round(leftover_units / 10, 1),
+        squad=squad_out,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tool registry used by the agent loop (name -> (input_schema, fn))
 # ---------------------------------------------------------------------------
 
@@ -510,6 +640,16 @@ TOOL_REGISTRY = {
         "description": (
             "Recall the squad most recently loaded via set_fpl_team for this conversation "
             "(the user's current 15 players, prices, bank, captain/vice-captain, bench)."
+        ),
+    },
+    "rebuild_squad": {
+        "schema": RebuildSquadInput,
+        "fn": rebuild_squad,
+        "description": (
+            "Remove the named players from the currently loaded squad and refill those slots "
+            "with the best-ranked affordable replacements, using the repo's existing "
+            "squad-building algorithm. Everyone else is kept unchanged. Requires a squad to "
+            "already be loaded via set_fpl_team/get_my_team."
         ),
     },
 }

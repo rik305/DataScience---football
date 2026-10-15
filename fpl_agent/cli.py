@@ -24,10 +24,12 @@ from fpl_agent.tools import (
     CaptainRecommendation,
     ManagerSquad,
     PlayerStats,
+    SquadRebuildResult,
     ToolError,
     TransferRecommendation,
     get_my_team,
     get_player_stats,
+    rebuild_squad,
     recommend_captain,
     recommend_transfers,
     set_fpl_team,
@@ -54,6 +56,8 @@ rate-limit usage, instant, fully deterministic):
   stats <player name>                    price/form/xG/xA/FDR/injury for one player
   transfers "<player>" <budget> <pos>    top 3 replacements, e.g. transfers "Watkins" 1.2 FWD
   captain <player1>, <player2>, ...      rank captain/vice-captain candidates
+  rebuild <player1>, <player2>, ...      rebuild your BEST squad after removing these players
+                                          (requires myteam to be loaded first this session)
 
 Other commands:
   reset            clear conversation history
@@ -187,6 +191,31 @@ def _handle_captain_command(arg: str) -> None:
     _print_captain(result)
 
 
+def _print_rebuild(result: SquadRebuildResult) -> None:
+    print(f"\n🛠️  Transferred out: {', '.join(result.transferred_out)}")
+    print(
+        f"   Budget available: £{result.budget_available_m}m  |  Rebuilt squad cost: "
+        f"£{result.total_cost_m}m  |  Leftover: £{result.leftover_budget_m}m"
+    )
+    print("   Best rebuilt squad (15):")
+    for p in result.squad:
+        tag = " 🆕" if p.status == "brought_in" else ""
+        print(f"     {p.position:<10} {p.player_name} ({p.team}) - £{p.price_m}m{tag}")
+    print("   🆕 = newly brought in to replace a transferred-out player.")
+
+
+def _handle_rebuild_command(arg: str) -> None:
+    names = [n.strip() for n in arg.split(",") if n.strip()]
+    if not names:
+        print('❌ Usage: rebuild <player1>, <player2>, ...  (e.g. rebuild Castagne, Schade)')
+        return
+    result = rebuild_squad(names)
+    if isinstance(result, ToolError):
+        _print_tool_error(result)
+        return
+    _print_rebuild(result)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Interactive FPL AI assistant.")
     parser.add_argument("--model", default=None, help="Override the LLM model (LiteLLM model string).")
@@ -203,7 +232,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.question and args.question[0].lower() in {"myteam", "stats", "transfers", "captain"}:
+    if args.question and args.question[0].lower() in {"myteam", "stats", "transfers", "captain", "rebuild"}:
+        if args.fpl_id is not None:
+            _handle_myteam_command(str(args.fpl_id))
         command, rest = args.question[0].lower(), args.question[1:]
         if command == "myteam":
             _handle_myteam_command(rest[0] if rest else "")
@@ -214,6 +245,10 @@ def main() -> None:
         elif command == "captain":
             # Each shell arg is one candidate name (quote multi-word names), so join with commas.
             _handle_captain_command(",".join(rest))
+        elif command == "rebuild":
+            # Needs a squad loaded first in this same process - pass --fpl-id (handled
+            # above) or run `myteam <id>` then `rebuild ...` in interactive mode instead.
+            _handle_rebuild_command(",".join(rest))
         return
 
     try:
@@ -257,6 +292,9 @@ def main() -> None:
             continue
         if question.lower() == "captain" or question.lower().startswith("captain "):
             _handle_captain_command(question[len("captain"):].strip())
+            continue
+        if question.lower() == "rebuild" or question.lower().startswith("rebuild "):
+            _handle_rebuild_command(question[len("rebuild"):].strip())
             continue
         if question.lower() == "limits":
             status = agent.rate_limiter.status()
