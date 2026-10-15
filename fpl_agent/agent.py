@@ -131,7 +131,10 @@ def _execute_tool(name: str, raw_arguments: str) -> str:
         return json.dumps({"error": f"Tool '{name}' failed: {exc}"})
 
     if isinstance(result, BaseModel):
-        return result.model_dump_json()
+        # exclude_none trims fields like unset match_note/rank_score, which add up
+        # across a 15-player squad payload - every bit of token savings matters
+        # against a tight free-tier TPM budget.
+        return result.model_dump_json(exclude_none=True)
     return json.dumps(result)
 
 
@@ -166,7 +169,7 @@ class FPLAgent:
                 self.rate_limiter.estimate_tokens(str(m.get("content") or "")) for m in self.history
             )
             try:
-                self.rate_limiter.check_and_record(estimated_tokens=estimated_tokens)
+                rate_limit_event = self.rate_limiter.check_and_record(estimated_tokens=estimated_tokens)
             except RateLimitExceeded as exc:
                 return f"🛑 {exc}"
 
@@ -179,6 +182,14 @@ class FPLAgent:
                 )
             except Exception as exc:  # noqa: BLE001
                 return f"⚠️ Agent error while calling the LLM ({self.model}): {exc}"
+
+            # Reconcile our pre-flight estimate with the provider's actual reported
+            # usage (input + output tokens), so the persisted ledger reflects reality
+            # for subsequent calls in this window instead of compounding estimation
+            # error across a multi-tool-call conversation.
+            usage = getattr(response, "usage", None)
+            if usage is not None and getattr(usage, "total_tokens", None):
+                self.rate_limiter.finalize_usage(rate_limit_event, usage.total_tokens)
 
             message = response.choices[0].message
             tool_calls = getattr(message, "tool_calls", None)

@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -67,6 +68,7 @@ class RateLimitConfig:
     max_requests_per_minute: int
     max_requests_per_day: int
     max_tokens_per_minute: int
+    reserved_output_tokens: int
 
     @classmethod
     def from_env(cls, prefix: str = "FPL_AGENT") -> "RateLimitConfig":
@@ -84,6 +86,11 @@ class RateLimitConfig:
             max_requests_per_minute=int(os.getenv(f"{prefix}_MAX_RPM", "15")),  # Groq free: 30 RPM
             max_requests_per_day=int(os.getenv(f"{prefix}_MAX_RPD", "250")),  # Groq free: 1,000 RPD
             max_tokens_per_minute=int(os.getenv(f"{prefix}_MAX_TPM", "6000")),  # Groq free: 8,000 TPM
+            # TPM is a *combined* input+output cap on Groq. Our pre-flight estimate only
+            # covers input (the conversation we're about to send) - this reserves headroom
+            # for that call's own completion tokens, which otherwise go completely
+            # unaccounted-for until after the fact.
+            reserved_output_tokens=int(os.getenv(f"{prefix}_RESERVED_OUTPUT_TOKENS", "800")),
         )
 
 
@@ -151,6 +158,11 @@ class LocalRateLimiter:
         data.setdefault("request_timestamps", [])
         data.setdefault("token_events", [])
         data.setdefault("count", 0)
+        # Guard against an older on-disk format (token_events used to be plain
+        # [timestamp, tokens] pairs rather than {"id", "ts", "tokens"} dicts).
+        # If we can't recognize the shape, start fresh rather than crashing.
+        if not all(isinstance(e, dict) and "id" in e and "ts" in e and "tokens" in e for e in data["token_events"]):
+            return _empty_state()
         return data
 
     def _save_state(self, state: dict) -> None:
@@ -169,20 +181,30 @@ class LocalRateLimiter:
 
     # -- core check --------------------------------------------------------------
 
-    def check_and_record(self, estimated_tokens: int = 0) -> None:
+    def check_and_record(self, estimated_tokens: int = 0) -> str:
         """
         Call immediately before making an LLM request. Raises
         `RateLimitExceeded` (without recording/consuming budget) if any
-        configured ceiling would be breached; otherwise records the request
-        and lets it proceed. Shared across processes via the persisted state
-        file, so rapid successive CLI invocations can't each start from zero.
+        configured ceiling would be breached; otherwise reserves budget for
+        this call (input estimate + `reserved_output_tokens` headroom for the
+        response, since Groq's TPM is a combined input+output cap) and
+        returns an opaque `event_id`.
+
+        Pass that `event_id` to `finalize_usage()` once the real call
+        completes and the provider reports actual token usage, so the ledger
+        reflects reality instead of compounding estimation error across a
+        multi-call conversation (this is what let earlier calls under-count
+        enough that a real Groq 429 happened before our local check tripped).
+
+        Shared across processes via the persisted state file, so rapid
+        successive CLI invocations can't each start from zero.
         """
         with self._locked():
             now = _now()
             state = self._load_state()
 
             request_timestamps = [t for t in state["request_timestamps"] if now - t < WINDOW_SECONDS]
-            token_events = [e for e in state["token_events"] if now - e[0] < WINDOW_SECONDS]
+            token_events = [e for e in state["token_events"] if now - e["ts"] < WINDOW_SECONDS]
             daily_count = state["count"]
 
             if daily_count >= self.config.max_requests_per_day:
@@ -198,22 +220,42 @@ class LocalRateLimiter:
                     "requests/min, local safety limit). Please wait a moment and retry."
                 )
 
-            tokens_in_window = sum(n for _, n in token_events)
-            if tokens_in_window + estimated_tokens > self.config.max_tokens_per_minute:
+            tokens_in_window = sum(e["tokens"] for e in token_events)
+            reserved = estimated_tokens + self.config.reserved_output_tokens
+            if tokens_in_window + reserved > self.config.max_tokens_per_minute:
                 raise RateLimitExceeded(
                     f"Per-minute token budget reached (~{self.config.max_tokens_per_minute} "
-                    "tokens/min, local safety limit). Please wait a moment and retry, or shorten "
-                    "the conversation (try 'reset')."
+                    "tokens/min, local safety limit, including headroom reserved for the "
+                    "response). Please wait a moment and retry, or shorten the conversation "
+                    "(try 'reset')."
                 )
 
+            event_id = uuid.uuid4().hex
             request_timestamps.append(now)
-            token_events.append([now, estimated_tokens])
+            token_events.append({"id": event_id, "ts": now, "tokens": reserved})
             self._save_state({
                 "date": _today_key(),
                 "count": daily_count + 1,
                 "request_timestamps": request_timestamps,
                 "token_events": token_events,
             })
+            return event_id
+
+    def finalize_usage(self, event_id: str, actual_tokens: int) -> None:
+        """
+        Replace the reserved estimate for `event_id` with the real token usage
+        the provider reported (e.g. `response.usage.total_tokens`), so later
+        calls within the same window see accurate cumulative usage instead of
+        our pre-flight guess. Safe to skip (the reservation just stands) if
+        the provider didn't report usage.
+        """
+        with self._locked():
+            state = self._load_state()
+            for event in state["token_events"]:
+                if event["id"] == event_id:
+                    event["tokens"] = actual_tokens
+                    break
+            self._save_state(state)
 
     def remaining_today(self) -> int:
         state = self._load_state()
@@ -223,7 +265,7 @@ class LocalRateLimiter:
         state = self._load_state()
         now = _now()
         rpm_used = len([t for t in state["request_timestamps"] if now - t < WINDOW_SECONDS])
-        tpm_used = sum(n for t, n in state["token_events"] if now - t < WINDOW_SECONDS)
+        tpm_used = sum(e["tokens"] for e in state["token_events"] if now - e["ts"] < WINDOW_SECONDS)
         return {
             "requests_last_minute": rpm_used,
             "max_requests_per_minute": self.config.max_requests_per_minute,
