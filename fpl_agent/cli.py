@@ -19,6 +19,7 @@ import sys
 from typing import Optional
 
 from fpl_agent.agent import FPLAgent
+from fpl_agent.data_loader import ManagerNotFoundError, store
 from fpl_agent.tools import (
     CaptainRecommendation,
     ManagerSquad,
@@ -31,6 +32,16 @@ from fpl_agent.tools import (
     recommend_transfers,
     set_fpl_team,
 )
+
+
+def _active_squad_names(exclude: str) -> list[str]:
+    """Names of every player in the currently loaded squad (if any), minus the one being sold -
+    so direct `transfers` calls never suggest a replacement already owned."""
+    try:
+        data = store.active_squad()
+    except ManagerNotFoundError:
+        return []
+    return [p["player_name"] for p in data["squad"] if p["player_name"].lower() != exclude.lower()]
 
 BANNER = """\
 ⚽ FPL Agent - data-driven Fantasy Premier League assistant
@@ -142,7 +153,9 @@ def _handle_transfers_command(arg: str, parts: Optional[list[str]] = None) -> No
         print(f"❌ '{budget_str}' isn't a valid budget number (e.g. 1.2).")
         return
     try:
-        result = recommend_transfers(player_name, budget, position)
+        result = recommend_transfers(
+            player_name, budget, position, exclude_player_names=_active_squad_names(player_name)
+        )
     except ValueError as exc:  # invalid position, raised by the Pydantic-adjacent validator
         print(f"❌ {exc}")
         return

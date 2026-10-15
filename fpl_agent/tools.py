@@ -132,6 +132,14 @@ class RecommendTransfersInput(BaseModel):
     current_player_name: str = Field(..., description="The player being replaced/sold.")
     bank_budget: float = Field(..., ge=0, description="Money in the bank (ITB), in millions, e.g. 1.2.")
     position: str = Field(..., description="Position of the replacement: GK, DEF, MID, or FWD.")
+    exclude_player_names: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Names of players to exclude from the candidate list - typically everyone already "
+            "in the user's current 15-man squad (from get_my_team/set_fpl_team), so a replacement "
+            "already owned is never recommended."
+        ),
+    )
 
     @field_validator("position")
     @classmethod
@@ -161,11 +169,17 @@ class TransferRecommendation(BaseModel):
 
 
 def recommend_transfers(
-    current_player_name: str, bank_budget: float, position: str
+    current_player_name: str,
+    bank_budget: float,
+    position: str,
+    exclude_player_names: Optional[list[str]] = None,
 ) -> TransferRecommendation | ToolError:
     """
     Use the repo's existing rank-score pipeline to find the top 3 replacements
     for `current_player_name` affordable within (selling price + bank_budget).
+
+    `exclude_player_names` lets a caller rule out players already owned (e.g. the
+    rest of the user's current squad), so a replacement isn't a player they already have.
     """
     try:
         match = store.find_player(current_player_name)
@@ -183,15 +197,22 @@ def recommend_transfers(
     max_budget_m = selling_price_m + bank_budget
     max_cost = round(max_budget_m * 10)
 
+    excluded = {matched_current.lower()}
+    for name in exclude_player_names or []:
+        excluded.add(name.lower())
+
     pool = store.by_position(element_type)
-    affordable = pool[(pool["now_cost"] <= max_cost) & (pool.index != matched_current)]
+    affordable = pool[
+        (pool["now_cost"] <= max_cost)
+        & (~pool.index.str.lower().isin(excluded))
+    ]
 
     if affordable.empty:
         return ToolError(
             error=(
                 f"No affordable {POSITION_NAMES.get(element_type)} found within "
                 f"£{max_budget_m:.1f}m (selling {matched_current} for £{selling_price_m:.1f}m "
-                f"+ £{bank_budget:.1f}m ITB)."
+                f"+ £{bank_budget:.1f}m ITB) once already-owned players are excluded."
             )
         )
 
@@ -461,7 +482,9 @@ TOOL_REGISTRY = {
         "fn": recommend_transfers,
         "description": (
             "Recommend the top 3 replacement players for a given position, affordable "
-            "within the player's selling price plus remaining bank budget (ITB)."
+            "within the player's selling price plus remaining bank budget (ITB). Pass "
+            "exclude_player_names (the user's current squad, from get_my_team) so a "
+            "player they already own is never suggested as the replacement."
         ),
     },
     "recommend_captain": {
