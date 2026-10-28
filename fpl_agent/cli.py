@@ -71,7 +71,7 @@ def _print_squad(squad: ManagerSquad) -> None:
     print(f"\n📋 {label} ({squad.manager_name or 'unknown manager'}) - GW{squad.gameweek}")
     print(f"   Bank: £{squad.bank_m}m | Squad value: £{squad.team_value_m}m")
     for p in squad.squad:
-        tag = " (C)" if p.is_captain else (" (VC)" if p.is_vice_captain else "")
+        tag = f" ({p.captaincy})" if p.captaincy else ""
         bench = " [bench]" if p.on_bench else ""
         rank = f", rank {p.rank_score}" if p.rank_score is not None else ""
         form = f", form {p.form}" if p.form is not None else ""

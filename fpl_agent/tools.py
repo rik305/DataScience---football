@@ -254,7 +254,17 @@ def recommend_transfers(
 # ---------------------------------------------------------------------------
 
 class RecommendCaptainInput(BaseModel):
-    candidate_names: list[str] = Field(..., min_length=1, description="Candidate player names to compare.")
+    candidate_names: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=6,
+        description=(
+            "A SHORT shortlist (at most 6) of realistic, attack-minded candidates to compare - "
+            "e.g. the squad's forwards/attacking midfielders by form or rank. Do not pass your "
+            "entire squad: goalkeepers/defensive players are rarely good captain picks, and a "
+            "longer list costs more tokens for no better an answer."
+        ),
+    )
 
 
 class CaptainCandidateScore(BaseModel):
@@ -360,9 +370,10 @@ class SquadPlayer(BaseModel):
     team: str
     price_m: float
     squad_slot: int = Field(..., description="1-11 = starting XI (ordered GK/DEF/MID/FWD), 12-15 = bench.")
-    on_bench: bool
-    is_captain: bool
-    is_vice_captain: bool
+    on_bench: Optional[bool] = Field(None, description="True if benched. Absent/null means starting XI.")
+    captaincy: Optional[Literal["C", "VC"]] = Field(
+        None, description="'C' if captain, 'VC' if vice-captain, absent/null otherwise."
+    )
     form: Optional[float] = None
     points_per_game: Optional[float] = None
     next_fixture_opponent: Optional[str] = None
@@ -401,17 +412,17 @@ def _build_squad_player(player: dict, players_all: pd.DataFrame, fixtures_df, te
         breakdown = fpl.player_fixture_breakdown(row, fixtures_df, team_names, lookahead=1)
         if breakdown:
             opponent = breakdown[0]["opponent"]
-            fdr = breakdown[0]["fdr"]
+            fdr = round(breakdown[0]["fdr"], 1)  # 1dp is plenty of precision and trims tokens x15 players
 
+    captaincy = "C" if player["is_captain"] else ("VC" if player["is_vice_captain"] else None)
     return SquadPlayer(
         player_name=name,
         position=POSITION_NAMES.get(player["element_type"], "Unknown"),
         team=player["team"],
         price_m=float(player["price_m"]),
         squad_slot=int(player["squad_slot"]),
-        on_bench=bool(player["on_bench"]),
-        is_captain=bool(player["is_captain"]),
-        is_vice_captain=bool(player["is_vice_captain"]),
+        on_bench=True if player["on_bench"] else None,
+        captaincy=captaincy,
         form=form,
         points_per_game=ppg,
         next_fixture_opponent=opponent,
@@ -621,8 +632,10 @@ TOOL_REGISTRY = {
         "schema": RecommendCaptainInput,
         "fn": recommend_captain,
         "description": (
-            "Compare a list of candidate players by expected points and upcoming fixture "
-            "difficulty to recommend a Captain and Vice-Captain."
+            "Compare a SHORT shortlist (at most 6) of realistic, attack-minded candidate "
+            "players by expected points and upcoming fixture difficulty to recommend a "
+            "Captain and Vice-Captain. Never pass a whole 15-man squad - narrow to forwards/ "
+            "attacking midfielders first."
         ),
     },
     "set_fpl_team": {

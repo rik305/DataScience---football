@@ -77,15 +77,23 @@ class RateLimitConfig:
         `openai/gpt-oss-20b` (the default model here): 30 RPM / 1,000 RPD /
         8,000 TPM / 200,000 TPD (see https://console.groq.com/docs/rate-limits,
         or https://console.groq.com/settings/limits for your account's exact
-        current numbers). We stay at roughly 50-75% of each published ceiling
-        so this local check consistently trips *before* Groq's own limit ever
-        could, even accounting for our token estimate being approximate.
-        Override via env vars if you switch models/plans with different limits.
+        current numbers). RPM/RPD stay at roughly 50-75% of their published
+        ceiling so this local check consistently trips *before* Groq's own
+        limit ever could.
+
+        TPM is set higher (90%, not 50-75%) because realistic multi-tool
+        conversations (e.g. set_fpl_team -> recommend_captain) are genuinely
+        token-heavy: the tool-call schema definitions alone (~1,000 tokens)
+        are resent on every single call in the loop, on top of the growing
+        tool-result history. At 50-75% there wasn't enough budget left for
+        even one personalized "my team" conversation to finish - it would
+        always trip before reaching a final answer. Override via env vars if
+        you switch models/plans with different limits.
         """
         return cls(
             max_requests_per_minute=int(os.getenv(f"{prefix}_MAX_RPM", "15")),  # Groq free: 30 RPM
             max_requests_per_day=int(os.getenv(f"{prefix}_MAX_RPD", "250")),  # Groq free: 1,000 RPD
-            max_tokens_per_minute=int(os.getenv(f"{prefix}_MAX_TPM", "6000")),  # Groq free: 8,000 TPM
+            max_tokens_per_minute=int(os.getenv(f"{prefix}_MAX_TPM", "7200")),  # Groq free: 8,000 TPM
             # TPM is a *combined* input+output cap on Groq. Our pre-flight estimate only
             # covers input (the conversation we're about to send) - this reserves headroom
             # for that call's own completion tokens, which otherwise go completely
